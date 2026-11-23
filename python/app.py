@@ -1,272 +1,146 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-
+# Sing-box carrier (Python runtime) - sanitized version.
+# Rules enforced: UUID is a REQUIRED env var (no literal default, exit if missing);
+# core binary is downloaded ONLY from the official SagerNet/sing-box GitHub release;
+# no third-party subscription conversion, no public subscription endpoint, and
+# nothing sensitive (UUID/links) is printed to logs.
+# The wrapper serves a plain HTTP page on $PORT and proxies WebSocket upgrades
+# on $WS_PATH to a sing-box VLESS+WS inbound on a loopback port.
+import io
+import json
 import os
-import sys
-import signal
-import time
-import stat
+import re
+import select
+import socket
 import subprocess
-import urllib.request
-import urllib.error
-import http.server
-import socketserver
+import sys
+import tarfile
 import threading
-import platform
-from pathlib import Path
+import urllib.request
 
-# 环境变量配置
-PORT = int(os.environ.get('PORT', 3000))       # http服务端口
-SUB_PATH = os.environ.get('SUB_PATH', 'sub')   # 订阅token
-config = {
-    'UUID': os.environ.get('UUID', 'b5c445d1-8e59-465f-af0c-1f4193d15693'), # 节点UUID，使用哪吒v1时在不不同的平台部署需要修改，否则agent会覆盖
-    'NEZHA_SERVER': os.environ.get('NEZHA_SERVER', ''), # 哪吒面板地址，v1格式: nezha.xxx.com:8008  v0格式： nezha.xxx.com
-    'NEZHA_PORT': os.environ.get('NEZHA_PORT', ''),     # 哪吒v1请留空，哪吒v0 agent端口
-    'NEZHA_KEY': os.environ.get('NEZHA_KEY', ''),       # 哪吒v1的NZ_CLIENT_SECRET或哪吒v0-agent密钥
-    'ARGO_DOMAIN': os.environ.get('ARGO_DOMAIN', ''),   # 固定隧道域名,留空即启用临时隧道
-    'ARGO_AUTH': os.environ.get('ARGO_AUTH', ''),       # 固定隧道token或json,留空即启用临时隧道,json获取:https://json.zone.id
-    'ARGO_PORT': os.environ.get('ARGO_PORT', '8001'),   # argo端口 使用固定隧道token,cloudflare后台设置的端口需和这里对应
-    'CFIP': os.environ.get('CFIP', 'saas.sin.fan'),     # 优选域名或优选ip
-    'CFPORT': os.environ.get('CFPORT', '443'),          # 优选域名或优选ip对应端口
-    'NAME': os.environ.get('NAME', ''),                 # 节点备注
-    'S5_PORT': os.environ.get('S5_PORT', ''),           # socks5端口,支持多端口玩具可填写，否则不动
-    'HY2_PORT': os.environ.get('HY2_PORT', ''),         # Hy2 端口，支持多端口玩具可填写，否则不动
-    'TUIC_PORT': os.environ.get('TUIC_PORT', ''),        # Tuic 端口，支持多端口玩具可填写，否则不动 
-    'ANYTLS_PORT': os.environ.get('ANYTLS_PORT', ''),    # AnyTLS 端口,支持多端口玩具可填写，否则不动
-    'REALITY_PORT': os.environ.get('REALITY_PORT', ''),      # Reality 端口,支持多端口玩具可填写，否则不动
-    'ANYREALITY_PORT': os.environ.get('ANYREALITY_PORT', ''), # AnyReality 端口,支持多端口玩具可填写，否则不动
-    'CHAT_ID': os.environ.get('CHAT_ID', ''),                 # TG chat_id，可在https://t.me/laowang_serv00_bot 获取
-    'BOT_TOKEN': os.environ.get('BOT_TOKEN', ''),             # TG bot_token, 使用自己的bot需要填写,使用上方的bot不用填写,不会给别人发送
-    'UPLOAD_URL': os.environ.get('UPLOAD_URL', ''),           # 节点上传地址，需部署merge-sub订阅器项目，例如：https://merge.xxx.com
-    'FILE_PATH': os.environ.get('FILE_PATH', '.cache'),       # sub,.txt节点存放目录
-    'DISABLE_ARGO': os.environ.get('DISABLE_ARGO', 'false'),  # 是否禁用argo, true为禁用,false为不禁用,默认开启
-    'SHOW_LOG': os.environ.get('SHOW_LOG', 'true'),  # 是否显示日志, true或yes显示用,false或no禁用,默认显示
-}
+UUID = os.environ.get("UUID", "")
+if not re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", UUID):
+    print("FATAL: env UUID is required (no default is provided)", file=sys.stderr)
+    sys.exit(1)
 
-def sleep(ms):
-    time.sleep(ms / 1000)
+PORT = int(os.environ.get("PORT", "3000"))
+WS_PATH = os.environ.get("WS_PATH", "/ws")
+SB_VERSION = os.environ.get("SB_VERSION", "1.11.15")
+CORE_PORT = 18080
+WORKDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".sb-core")
+CAMO = (b"<!doctype html><html><head><title>Welcome</title></head>"
+        b"<body><h1>Welcome</h1><p>Site under construction.</p></body></html>")
 
-def get_architecture():
-    """获取系统架构"""
-    arch = platform.machine().lower()
-    system = platform.system().lower()
-    
-    if system in ['linux', 'darwin']:
-        if arch in ['x86_64', 'amd64']:
-            return 'amd64'
-        elif arch in ['aarch64', 'arm64']:
-            return 'arm64'
-    
-    raise Exception(f"Unsupported architecture: {system} {arch}")
 
-def download_file(url, dest_path):
-    # print(f"Downloading from: {url}")
-    opener = urllib.request.build_opener()
-    opener.addheaders = [
-        ('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'),
-        ('Accept', '*/*'),
-        ('Connection', 'keep-alive')
-    ]
-    
-    urllib.request.install_opener(opener)
-    
+def ensure_core():
+    os.makedirs(WORKDIR, exist_ok=True)
+    binary = os.path.join(WORKDIR, "sing-box")
+    if os.path.exists(binary):
+        return binary
+    arch = "amd64" if os.uname().machine in ("x86_64", "amd64") else "arm64"
+    name = f"sing-box-{SB_VERSION}-linux-{arch}"
+    url = f"https://github.com/SagerNet/sing-box/releases/download/v{SB_VERSION}/{name}.tar.gz"
+    req = urllib.request.Request(url, headers={"User-Agent": "carrier"})
+    with urllib.request.urlopen(req) as resp, tarfile.open(fileobj=io.BytesIO(resp.read()), mode="r:gz") as tar:
+        member = tar.getmember(f"{name}/sing-box")
+        member.name = "sing-box"
+        tar.extract(member, WORKDIR)
+    os.chmod(binary, 0o755)
+    return binary
+
+
+def write_config():
+    cfg = {
+        "log": {"level": "warn"},
+        "inbounds": [{
+            "type": "vless",
+            "listen": "127.0.0.1",
+            "listen_port": CORE_PORT,
+            "users": [{"uuid": UUID}],
+            "transport": {"type": "ws", "path": WS_PATH},
+        }],
+        "outbounds": [{"type": "direct"}],
+    }
+    path = os.path.join(WORKDIR, "config.json")
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    return path
+
+
+def tunnel(client, core):
+    socks = [client, core]
     try:
-        # 下载文件
-        urllib.request.urlretrieve(url, dest_path)
-        # print("Download completed!")
-    except urllib.error.HTTPError as e:
-        if os.path.exists(dest_path):
-            os.unlink(dest_path)
-        raise Exception(f"Download failed (HTTP {e.code}): {e.reason}")
-    except urllib.error.URLError as e:
-        if os.path.exists(dest_path):
-            os.unlink(dest_path)
-        raise Exception(f"Download failed (URL error): {str(e)}")
-    except Exception as e:
-        if os.path.exists(dest_path):
-            os.unlink(dest_path)
-        raise Exception(f"Download failed: {str(e)}")
-
-def set_executable(file_path):
-    """设置文件可执行权限"""
-    try:
-        current_permissions = os.stat(file_path).st_mode
-        os.chmod(file_path, current_permissions | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-    except Exception as e:
-        raise Exception(f"Failed to set executable permission: {str(e)}")
-
-def delete_file(file_path):
-    """删除文件"""
-    try:
-        if os.path.exists(file_path):
-            os.unlink(file_path)
-    except Exception as e:
-        print(f"Failed to delete file {file_path}: {str(e)}")
-
-class CustomHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
-    """自定义HTTP请求处理器"""
-    
-    def do_GET(self):
-        if self.path == '/':
-            self.handle_root()
-        elif self.path == f'/{SUB_PATH}':
-            self.handle_sub()
-        elif self.path == '/ps':
-            self.handle_ps()
-        else:
-            self.send_error(404, '404 Not Found')
-    
-    def handle_root(self):
-        """处理根路径请求"""
-        try:
-            html_path = os.path.join(os.path.dirname(__file__), 'index.html')
-            if os.path.exists(html_path):
-                with open(html_path, 'r', encoding='utf-8') as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html')
-                self.end_headers()
-                self.wfile.write(data.encode('utf-8'))
-            else:
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/html; charset=utf-8')
-                self.end_headers()
-                self.wfile.write("Hello world!<br><br>You can access /{SUB_PATH}(Default: /sub) to get your nodes!".encode('utf-8'))
-        except Exception as e:
-            self.send_error(500, str(e))
-    
-    def handle_sub(self):
-        """处理订阅路径请求"""
-        sub_file_path = os.path.join(config['FILE_PATH'], 'sub.txt')
-        try:
-            if os.path.exists(sub_file_path):
-                with open(sub_file_path, 'r', encoding='utf-8') as f:
-                    data = f.read()
-                self.send_response(200)
-                self.send_header('Content-Type', 'text/plain')
-                self.end_headers()
-                self.wfile.write(data.encode('utf-8'))
-            else:
-                self.send_error(404, f'Sub file not found at: {sub_file_path}')
-        except Exception as e:
-            self.send_error(500, str(e))
-    
-    def handle_ps(self):
-        """处理进程列表请求"""
-        try:
-            result = subprocess.run(['ps', 'aux'], capture_output=True, text=True, check=True)
-            self.send_response(200)
-            self.send_header('Content-Type', 'text/plain')
-            self.end_headers()
-            self.wfile.write(result.stdout.encode('utf-8'))
-        except subprocess.CalledProcessError as e:
-            self.send_error(500, f'Error executing ps command: {str(e)}')
-    
-    def log_message(self, format, *args):
-        """覆盖日志方法，不输出访问日志"""
+        while True:
+            readable, _, _ = select.select(socks, [], [], 60)
+            if not readable:
+                break
+            for s in readable:
+                data = s.recv(65536)
+                if not data:
+                    return
+                (core if s is client else client).sendall(data)
+    except OSError:
         pass
+    finally:
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
 
-def start_http_server():
-    """启动HTTP服务器"""
-    handler = CustomHTTPRequestHandler
-    
-    # 创建服务器，允许地址重用
-    socketserver.TCPServer.allow_reuse_address = True
-    httpd = socketserver.TCPServer(('0.0.0.0', PORT), handler)
-    
-    server_thread = threading.Thread(target=httpd.serve_forever)
-    server_thread.daemon = True
-    server_thread.start()
-    
-    return httpd
 
-def cleanup(binary_path):
-    """清理二进制文件"""
-    delete_file(binary_path)
+def handle(client):
+    try:
+        buf = b""
+        while b"\r\n\r\n" not in buf and len(buf) < 65536:
+            chunk = client.recv(4096)
+            if not chunk:
+                client.close()
+                return
+            buf += chunk
+        head = buf.split(b"\r\n\r\n", 1)[0].decode("latin-1", "replace")
+        lines = head.split("\r\n")
+        parts = lines[0].split(" ") if lines else []
+        path = parts[1] if len(parts) > 1 else "/"
+        headers = {}
+        for line in lines[1:]:
+            k, _, v = line.partition(":")
+            if k:
+                headers[k.strip().lower()] = v.strip()
+        if path.startswith(WS_PATH) and headers.get("upgrade", "").lower() == "websocket":
+            core = socket.create_connection(("127.0.0.1", CORE_PORT), timeout=10)
+            core.sendall(buf)
+            tunnel(client, core)
+        else:
+            body = CAMO
+            resp = (b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: "
+                    + str(len(body)).encode() + b"\r\nConnection: close\r\n\r\n" + body)
+            client.sendall(resp)
+            client.close()
+    except OSError:
+        try:
+            client.close()
+        except OSError:
+            pass
+
 
 def main():
-    """主函数"""
-    binary_path = None
-    httpd = None
-    process = None
-    
+    binary = ensure_core()
+    config = write_config()
+    core = subprocess.Popen([binary, "run", "-c", config],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
-        # 启动HTTP服务器
-        httpd = start_http_server()
-        
-        # 获取架构并下载
-        arch = get_architecture()
-        download_url = 'https://amd64.eooce.com/sbsh' if arch == 'amd64' else 'https://arm64.eooce.com/sbsh'
-        
-        # print(f"Using download link: {download_url}")
-        binary_path = os.path.join(os.getcwd(), 'sbsh')
-        
-        download_file(download_url, binary_path)
-        if not os.path.exists(binary_path):
-            raise Exception('Download failed, file does not exist at the specified path')
-        
-        set_executable(binary_path)
-        
-        # 准备环境变量
-        env = os.environ.copy()
-        env.update({k: str(v) for k, v in config.items()})
-        
-        # 启动子进程
-        process = subprocess.Popen(
-            [binary_path],
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            universal_newlines=True,
-            bufsize=1
-        )
-        
-        # 实时输出子进程日志
-        def log_output():
-            for line in process.stdout:
-                print(line, end='')
-        
-        log_thread = threading.Thread(target=log_output)
-        log_thread.daemon = True
-        log_thread.start()
-        
-        sleep(18000)
-        # print('\nLogs will be deleted in 90 seconds, you can copy the above nodes!')
-        
-        sleep(90000)
-        
-        cleanup(binary_path)
-        
-        # 清除控制台
-        os.system('clear' if os.name == 'posix' else 'cls')
-        
-        print('✅  App is running')
-        print(f'🌐  HTTP server is running on {PORT}')
-        
-        # 保持主线程运行
-        try:
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            print("\nShutting down...")
-            
-    except Exception as e:
-        print(f"\n❌ An error occurred: {str(e)}")
-        if binary_path:
-            cleanup(binary_path)
-        sys.exit(1)
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind(("0.0.0.0", PORT))
+        server.listen(128)
+        print(f"listening on {PORT}")
+        while True:
+            client, _ = server.accept()
+            threading.Thread(target=handle, args=(client,), daemon=True).start()
     finally:
-        if process and process.poll() is None:
-            process.terminate()
-        if httpd:
-            httpd.shutdown()
+        core.terminate()
 
-def signal_handler(signum, frame):
-    print("\nReceived signal to terminate")
-    sys.exit(0)
 
 if __name__ == "__main__":
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-
     main()

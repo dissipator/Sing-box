@@ -21,7 +21,7 @@ export ARGO_DOMAIN=${ARGO_DOMAIN:-''}
 export ARGO_AUTH=${ARGO_AUTH:-''}
 export CFIP=${CFIP:-'cf.877774.xyz'} 
 export CFPORT=${CFPORT:-'443'} 
-export SUB_TOKEN=${SUB_TOKEN:-${UUID:0:8}}
+export SUB_TOKEN=${SUB_TOKEN:-$(cat /proc/sys/kernel/random/uuid)}
 
 if [[ "$HOSTNAME" =~ ct8 ]]; then
     CURRENT_DOMAIN="ct8.pl"

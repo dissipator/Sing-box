@@ -1,3 +1,17 @@
+# 部署口径（Lei 维护，2026-11-23 修复版）
+
+本 fork 为 luo 的运行时平台部署载体，口径如下：
+
+- 运行时平台统一用 `nodejs/`、`python/`、`go/`、`php/` 四个入口部署 sing-box（VLESS+WS）。
+- **UUID 必须走 env 必填**：四个入口均无写死默认 UUID，env 缺失或格式不合法直接退出。
+- **核心只下官方来源**：sing-box 二进制只从 SagerNet/sing-box 的 GitHub release 下载，不用任何私有镜像。
+- **订阅走 NodeHub 自建组**：不使用任何第三方订阅转换服务，入口不打印 UUID/订阅等敏感信息。
+- `java/` 入口已下架：原预编译 server.jar 来源不可审、且提交过写死 UUID 的 .env，已删除，待有源码版再恢复。
+- `sing-box.sh`、`sb_serv00.sh`、`sb_00.sh`、`sb4.sh` 为 legacy VPS 一键脚本，非部署载体；其中写死的 SUB_TOKEN 已改为 env 优先、缺失随机生成。
+- 原仓库：lucaslml0/Sing-box（未改动）；本 fork 的 nodejs 入口修复版与本地 singbox-carrier-fixed 一致。
+
+---
+
 <div align="center">
 
 # sing-box多协议代理工具
